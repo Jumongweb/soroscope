@@ -3,8 +3,12 @@ mod errors;
 mod simulation_service;
 
 use crate::errors::AppError;
-use axum::{routing::get, Router};
-use simulation_service::SimulationService;
+use axum::{
+    extract::State,
+    routing::{get, post},
+    Json, Router,
+};
+use simulation_service::{AnalysisResult, SimulationMetric, SimulationService};
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -61,16 +65,27 @@ async fn main() {
         .route(
             "/",
             get(|| async {
-                "Hello from SoroScope! Usage: cargo run -p soroscope-core -- benchmark"
+                "Hello from SoroScope! Use POST /simulations/analyze to persist + compare simulation metrics."
             }),
         )
+        .route("/health", get(|| async { "ok" }))
         .route(
             "/error",
             get(|| async { Err::<&str, AppError>(AppError::BadRequest("Test error".to_string())) }),
-        );
+        )
+        .route("/simulations/analyze", post(analyze_simulation))
+        .with_state(simulation_service);
 
     // run it with hyper on localhost:3000
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     println!("listening on {}", listener.local_addr().unwrap());
     axum::serve(listener, app).await.unwrap();
+}
+
+async fn analyze_simulation(
+    State(simulation_service): State<Arc<SimulationService>>,
+    Json(metric): Json<SimulationMetric>,
+) -> Result<Json<AnalysisResult>, AppError> {
+    let result = simulation_service.record_and_analyze(metric).await?;
+    Ok(Json(result))
 }

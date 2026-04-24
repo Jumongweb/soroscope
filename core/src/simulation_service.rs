@@ -358,3 +358,151 @@ fn z_score(current: f64, values: &[f64]) -> Option<f64> {
 
     Some((current - mean) / std_dev)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct TempDbPath(PathBuf);
+
+    impl TempDbPath {
+        fn new(test_name: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("soroscope_{test_name}_{nanos}.db"));
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDbPath {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    fn metric(
+        contract: &str,
+        method: &str,
+        code_hash: &str,
+        cpu: u64,
+        ram: u64,
+        ledger: u64,
+    ) -> SimulationMetric {
+        SimulationMetric {
+            contract: contract.to_string(),
+            method: method.to_string(),
+            code_hash: code_hash.to_string(),
+            cpu_instructions: cpu,
+            ram_bytes: ram,
+            ledger_footprint: ledger,
+        }
+    }
+
+    fn alert_count(db_path: &Path) -> usize {
+        let conn = Connection::open(db_path).expect("open sqlite database");
+        conn.query_row("SELECT COUNT(*) FROM simulation_alerts", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("count alerts") as usize
+    }
+
+    #[tokio::test]
+    async fn first_sample_has_no_historical_baseline() {
+        let db_path = TempDbPath::new("first_sample_has_no_historical_baseline");
+        let service =
+            SimulationService::new(&db_path.0, None).expect("initialize simulation service");
+
+        let result = service
+            .record_and_analyze(metric("token", "mint", "hash-a", 100, 100, 100))
+            .await
+            .expect("record and analyze should succeed");
+
+        assert!(!result.has_historical_baseline);
+        assert!(!result.alert_triggered);
+        assert!(result.outliers.is_empty());
+        assert_eq!(alert_count(&db_path.0), 0);
+    }
+
+    #[tokio::test]
+    async fn same_code_hash_shift_over_ten_percent_triggers_alert() {
+        let db_path = TempDbPath::new("same_code_hash_shift_triggers_alert");
+        let service =
+            SimulationService::new(&db_path.0, None).expect("initialize simulation service");
+
+        service
+            .record_and_analyze(metric("token", "mint", "hash-a", 100, 200, 300))
+            .await
+            .expect("seed metric should succeed");
+
+        let result = service
+            .record_and_analyze(metric("token", "mint", "hash-a", 130, 250, 400))
+            .await
+            .expect("second metric should succeed");
+
+        assert!(result.has_historical_baseline);
+        assert!(result.alert_triggered);
+        assert!(!result.outliers.is_empty());
+        assert_eq!(alert_count(&db_path.0), 1);
+    }
+
+    #[tokio::test]
+    async fn different_code_hash_does_not_trigger_no_code_change_alert() {
+        let db_path = TempDbPath::new("different_code_hash_does_not_alert");
+        let service =
+            SimulationService::new(&db_path.0, None).expect("initialize simulation service");
+
+        service
+            .record_and_analyze(metric("token", "transfer", "hash-a", 100, 200, 300))
+            .await
+            .expect("seed metric should succeed");
+
+        let result = service
+            .record_and_analyze(metric("token", "transfer", "hash-b", 1_000, 2_000, 3_000))
+            .await
+            .expect("code-hash change metric should succeed");
+
+        assert!(!result.has_historical_baseline);
+        assert!(!result.alert_triggered);
+        assert!(result.outliers.is_empty());
+        assert_eq!(alert_count(&db_path.0), 0);
+    }
+
+    #[tokio::test]
+    async fn z_score_outlier_triggers_even_under_ten_percent_shift() {
+        let db_path = TempDbPath::new("z_score_outlier_triggers_alert");
+        let service =
+            SimulationService::new(&db_path.0, None).expect("initialize simulation service");
+
+        for cpu in [95_u64, 100, 100, 102, 103] {
+            service
+                .record_and_analyze(metric("token", "burn", "hash-z", cpu, 1_000, 200))
+                .await
+                .expect("seed metric should succeed");
+        }
+
+        let result = service
+            .record_and_analyze(metric("token", "burn", "hash-z", 106, 1_000, 200))
+            .await
+            .expect("z-score outlier metric should succeed");
+
+        let cpu_outlier = result
+            .outliers
+            .iter()
+            .find(|detail| detail.metric == "cpu_instructions")
+            .expect("cpu outlier should be present");
+
+        assert!(result.has_historical_baseline);
+        assert!(result.alert_triggered);
+        assert!(cpu_outlier.percent_shift < 0.10);
+        assert!(cpu_outlier
+            .z_score
+            .map(|z| z.abs() > DEFAULT_ZSCORE_THRESHOLD)
+            .unwrap_or(false));
+        assert_eq!(alert_count(&db_path.0), 1);
+    }
+}

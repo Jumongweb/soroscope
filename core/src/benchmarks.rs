@@ -1,7 +1,7 @@
 use crate::simulation_service::{SimulationMetric, SimulationService};
 use sha2::{Digest, Sha256};
 use soroban_sdk::{
-    testutils::Address as _, xdr::ScVal, Address, Bytes, Env, IntoVal, String, Symbol, Val, Vec,
+    testutils::Address as _, Address, Bytes, Env, IntoVal, String, Symbol, Val, Vec,
 };
 use std::fs;
 use std::path::PathBuf;
