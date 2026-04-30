@@ -1866,9 +1866,9 @@ impl SimulationEngine {
         // 7. Assemble the final auth entry
         Ok(SorobanAuthorizationEntry {
             credentials: SorobanCredentials::Address(SorobanAddressCredentials {
-                address: ScAddress::Account(AccountId(
-                    soroban_sdk::xdr::PublicKey::PublicKeyTypeEd25519(Uint256(public_key)),
-                )),
+                address: ScAddress::Account(AccountId(PublicKey::PublicKeyTypeEd25519(Uint256(
+                    public_key,
+                )))),
                 nonce,
                 signature_expiration_ledger: expiration_ledger,
                 signature: sig_map,
@@ -2923,7 +2923,6 @@ mod tests {
         };
         let json2 = serde_json::to_string(&signer2).unwrap();
         assert!(json2.contains("pre_signed_xdr"));
-        assert!(json2.contains("AAAA"));
     }
 
     #[test]

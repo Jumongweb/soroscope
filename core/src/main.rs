@@ -45,10 +45,11 @@ use crate::fee_collector::{FeeCollector, FeeCollectorConfig};
 use crate::fee_store::FeeStore;
 use crate::cache::{DiskCache, DiskCacheConfig};
 use crate::insights::InsightsEngine;
-use crate::jobs::{JobQueue, JobQueueConfig, JobWorker};
-use crate::ws::SimulationBus;
-use crate::rpc_provider::{ProviderRegistry, RpcProvider};
-use crate::simulation::{SimulationCache, SimulationEngine, SimulationMode, SimulationResult};
+use crate::jobs::{
+    JobId, JobQueue, JobQueueConfig, JobWorker, SubmitJobRequest, SubmitJobResponse,
+};
+use crate::rpc_provider::{ProviderRegistry, RegistryConfig, RegistrySnapshot, RpcProvider};
+use crate::simulation::{SimulationCache, SimulationEngine, SimulationResult};
 use axum::{
     extract::{Json, Multipart, State},
     http::{HeaderMap, HeaderName, HeaderValue},
@@ -96,9 +97,21 @@ struct AppConfig {
     /// When empty or absent the engine falls back to `soroban_rpc_url`.
     #[serde(default)]
     rpc_providers: String,
+    /// Stable node identifier used for gossip snapshots.
+    #[serde(default)]
+    registry_instance_id: String,
+    /// Public base URL announced to peers, e.g. `https://api-a.example.com`.
+    #[serde(default)]
+    registry_public_url: String,
+    /// Seed peers as a JSON array or comma-separated list of base URLs.
+    #[serde(default)]
+    registry_seed_peers: String,
     /// Health-check interval in seconds (default 30).
     #[serde(default = "default_health_check_interval")]
     health_check_interval_secs: u64,
+    /// Gossip sync interval in seconds (default 30).
+    #[serde(default = "default_gossip_interval_secs")]
+    gossip_interval_secs: u64,
     /// Simulation timeout in seconds (default 30).
     #[serde(default = "default_simulation_timeout_secs")]
     simulation_timeout_secs: u64,
@@ -142,8 +155,8 @@ fn default_simulation_timeout_secs() -> u64 {
     30
 }
 
-fn default_simulation_mode() -> String {
-    "failover".to_string()
+fn default_gossip_interval_secs() -> u64 {
+    30
 }
 
 fn default_database_url() -> String {
@@ -193,7 +206,11 @@ fn load_config() -> Result<AppConfig, ConfigError> {
         .set_default("network_passphrase", "Test SDF Network ; September 2015")?
         .set_default("redis_url", "redis://127.0.0.1:6379")?
         .set_default("rpc_providers", "")?
+        .set_default("registry_instance_id", "")?
+        .set_default("registry_public_url", "")?
+        .set_default("registry_seed_peers", "")?
         .set_default("health_check_interval_secs", 30)?
+        .set_default("gossip_interval_secs", 30)?
         .set_default("simulation_timeout_secs", 30)?
         .set_default("simulation_mode", "failover")?
         .set_default("database_url", "sqlite://soroscope.db")?
@@ -238,12 +255,57 @@ fn build_providers(config: &AppConfig) -> Vec<RpcProvider> {
         url: config.soroban_rpc_url.clone(),
         auth_header: None,
         auth_value: None,
+        advertise: None,
     }]
+}
+
+fn parse_seed_peers(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    if trimmed.starts_with('[') {
+        return serde_json::from_str::<Vec<String>>(trimmed).unwrap_or_default();
+    }
+
+    trimmed
+        .split(',')
+        .map(|peer| peer.trim().trim_end_matches('/').to_string())
+        .filter(|peer| !peer.is_empty())
+        .collect()
+}
+
+fn build_registry_config(config: &AppConfig) -> RegistryConfig {
+    let instance_id = if config.registry_instance_id.trim().is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        config.registry_instance_id.trim().to_string()
+    };
+
+    let public_base_url = if config.registry_public_url.trim().is_empty() {
+        Some(format!("http://127.0.0.1:{}", config.server_port))
+    } else {
+        Some(
+            config
+                .registry_public_url
+                .trim()
+                .trim_end_matches('/')
+                .to_string(),
+        )
+    };
+
+    RegistryConfig {
+        instance_id,
+        public_base_url,
+        seed_peers: parse_seed_peers(&config.registry_seed_peers),
+    }
 }
 
 /// Shared application state injected into every Axum handler via [`State`].
 pub struct AppState {
     engine: SimulationEngine,
+    provider_registry: Arc<ProviderRegistry>,
     cache: Arc<SimulationCache>,
     insights_engine: InsightsEngine,
     gas_golfing_analyzer: GasGolfingAnalyzer,
@@ -956,6 +1018,8 @@ async fn analyze_gas_golfing(
 async fn fee_recommend(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<FeeRecommendationResponse>, AppError> {
+    use crate::fee_analytics::TrendDirection;
+
     tracing::info!("Generating fee recommendation");
 
     // Get recent samples for analysis
@@ -1118,6 +1182,26 @@ struct ApiDoc;
 
 async fn health_check() -> &'static str {
     "OK"
+}
+
+async fn registry_providers(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<crate::rpc_provider::ProviderHealthReport>> {
+    Json(state.provider_registry.provider_reports().await)
+}
+
+async fn registry_peers(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<crate::rpc_provider::PeerHealthReport>> {
+    Json(state.provider_registry.peer_reports().await)
+}
+
+async fn registry_gossip(
+    State(state): State<Arc<AppState>>,
+    Json(snapshot): Json<RegistrySnapshot>,
+) -> Json<RegistrySnapshot> {
+    state.provider_registry.merge_snapshot(snapshot).await;
+    Json(state.provider_registry.registry_snapshot().await)
 }
 
 #[tokio::main]
@@ -1338,7 +1422,12 @@ async fn main() {
     let provider_names: Vec<&str> = providers.iter().map(|p| p.name.as_str()).collect();
     tracing::info!(providers = ?provider_names, "RPC provider pool");
 
-    let registry = ProviderRegistry::new(providers);
+    let registry = ProviderRegistry::new_with_config(providers, build_registry_config(&config));
+    tracing::info!(
+        instance_id = registry.instance_id(),
+        public_url = ?registry.public_base_url(),
+        "Provider registry initialized"
+    );
 
     // Spawn background health checker.
     let health_interval = std::time::Duration::from_secs(config.health_check_interval_secs);
@@ -1346,6 +1435,13 @@ async fn main() {
     tracing::info!(
         interval_secs = config.health_check_interval_secs,
         "Background RPC health checker started"
+    );
+
+    let gossip_interval = std::time::Duration::from_secs(config.gossip_interval_secs);
+    let _gossip_handle = registry.spawn_gossip_task(gossip_interval);
+    tracing::info!(
+        interval_secs = config.gossip_interval_secs,
+        "Provider gossip sync started"
     );
 
     let simulation_timeout = std::time::Duration::from_secs(config.simulation_timeout_secs);
@@ -1514,7 +1610,8 @@ async fn main() {
             simulation_timeout,
             simulation_mode,
         ),
-        cache,
+        provider_registry: Arc::clone(&registry),
+        cache: SimulationCache::new(),
         insights_engine: InsightsEngine::new(),
         gas_golfing_analyzer: GasGolfingAnalyzer::new(),
         simulation_timeout,
@@ -1543,6 +1640,9 @@ async fn main() {
             }),
         )
         .route("/health", get(health_check))
+        .route("/registry/providers", get(registry_providers))
+        .route("/registry/peers", get(registry_peers))
+        .route("/registry/gossip", post(registry_gossip))
         .route("/auth/challenge", post(auth::challenge_handler))
         .route("/auth/verify", post(auth::verify_handler))
         // Fee market routes (public access)

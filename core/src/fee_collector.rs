@@ -144,7 +144,7 @@ impl FeeCollector {
         }
 
         // Try the first healthy provider
-        let provider = providers[0];
+        let provider = &providers[0];
 
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -194,7 +194,7 @@ impl FeeCollector {
             return Err(FeeCollectorError::NoHealthyProviders);
         }
 
-        let provider = providers[0];
+        let provider = &providers[0];
 
         // Try getLedgers endpoint first (if available)
         // Fallback to parsing from getTransactions if needed
@@ -326,7 +326,7 @@ impl FeeCollector {
         };
 
         // Get close time from response
-        let _close_time = json["result"]["latestLedger"].as_u64().unwrap_or(sequence);
+        let close_time = json["result"]["latestLedger"].as_u64().unwrap_or(sequence);
 
         Ok(LedgerFeeSample {
             ledger_sequence: sequence as i64,
